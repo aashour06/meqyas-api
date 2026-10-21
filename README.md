@@ -22,6 +22,7 @@ AI/
 ├── .gitignore
 ├── main.py                         # FastAPI service for real-time anomaly detection
 ├── predict.py                      # CLI script for batch anomaly prediction
+├── test_api.py                     # API test suite
 ├── requirements.txt
 └── README.md
 ```
@@ -80,15 +81,16 @@ Data Reading → EDA → Feature Engineering → Preprocessing → Model Trainin
 - **Scoring**: Custom anomaly scoring function based on decision-function separation
 - **Train/Test split**: 70 / 30 (random_state=42)
 
-### 5. Multi-Criteria Anomaly Detection
+### 5. Dynamic Percentage Anomaly Scoring
 
-A reading is identified as an anomaly if any of the following conditions occur:
-1. **Active machine alarm** (`alarm == 1`)
-2. **Alarm or interrupted machine state** (`status == 3` or `"alarm or interrupted state"`)
-3. **Power surge exceeding rated machine limit** (`power_avg > 10.0 kW`)
-4. **Invalid sensor telemetry** (negative power or items)
-5. **Isolation Forest outlier detection** (`raw_score < 0`)
-6. **Anomaly score percentage meeting or exceeding threshold** (default 50.0%)
+The anomaly score percentage is **continuously and dynamically scaled** based on severity:
+- **Normal Telemetry**: Scales smoothly from `0.0%` to `< 50.0%` (e.g., standard normal operation ~ `25.5%`).
+- **Anomalous Conditions**: Scale dynamically from `50.0%` to `100.0%` based on telemetry severity:
+  - Active alarm flag (`alarm == 1`): dynamically contributes to risk based on power state (~ `77%` - `85%`)
+  - Machine in alarm/interrupted state (`status == 3`): ~ `73%` - `80%`
+  - Power surge (`power_avg > 10.0 kW`): scales proportionally with excess power (e.g. 20 kW -> ~ `83.6%`, 35 kW -> ~ `89.3%`)
+  - Multi-fault critical conditions (alarm + power surge): ~ `90%` - `98%`
+  - Statistical outliers detected by IsolationForest (`raw_score < 0`): ~ `70%` - `100%`
 
 ## Getting Started
 
@@ -153,7 +155,7 @@ curl -X POST "http://localhost:8000/predict" \
 }
 ```
 
-##### Example 2: Anomaly Condition — Active Alarm (`POST /predict`):
+##### Example 2: Anomaly — Active Alarm (`POST /predict`):
 
 ```bash
 curl -X POST "http://localhost:8000/predict" \
@@ -161,7 +163,7 @@ curl -X POST "http://localhost:8000/predict" \
      -d '{
        "asset": 0,
        "items": 4.0,
-       "status": 3,
+       "status": 2,
        "power_avg": 2.0,
        "alarm": 1,
        "product": 0
@@ -172,26 +174,25 @@ curl -X POST "http://localhost:8000/predict" \
 {
   "is_anomaly": true,
   "prediction": "anomaly",
-  "anomaly_percentage": 85.0,
-  "raw_score": 0.045123,
-  "message": "Anomaly detected: Active machine alarm signal (alarm=1) with 85.00% anomaly score.",
+  "anomaly_percentage": 77.44,
+  "raw_score": 0.073976,
+  "message": "Anomaly detected: Active machine alarm signal (alarm=1) with 77.44% anomaly score.",
   "anomaly_reasons": [
-    "Active machine alarm signal (alarm=1)",
-    "Machine in alarm or interrupted state (status=3)"
+    "Active machine alarm signal (alarm=1)"
   ]
 }
 ```
 
-##### Example 3: Anomaly Condition — Extreme Power Surge (`POST /predict`):
+##### Example 3: Anomaly — Power Surge at 20 kW (`POST /predict`):
 
 ```bash
 curl -X POST "http://localhost:8000/predict" \
      -H "Content-Type: application/json" \
      -d '{
        "asset": 1,
-       "items": 2.0,
+       "items": 4.0,
        "status": 2,
-       "power_avg": 18.5,
+       "power_avg": 20.0,
        "alarm": 0,
        "product": 1
      }'
@@ -201,13 +202,39 @@ curl -X POST "http://localhost:8000/predict" \
 {
   "is_anomaly": true,
   "prediction": "anomaly",
-  "anomaly_percentage": 85.0,
-  "raw_score": -0.012345,
-  "message": "Anomaly detected: Power consumption exceeds rated limit (18.50 kW > 10.0 kW) with 85.00% anomaly score.",
+  "anomaly_percentage": 83.56,
+  "raw_score": 0.047232,
+  "message": "Anomaly detected: Power consumption exceeds rated limit (20.00 kW > 10.0 kW) with 83.56% anomaly score.",
   "anomaly_reasons": [
-    "Power consumption exceeds rated limit (18.50 kW > 10.0 kW)",
-    "Isolation Forest classified reading as outlier (raw_score=-0.012345 < 0)",
-    "Anomaly score (85.00%) meets or exceeds threshold (50.00%)"
+    "Power consumption exceeds rated limit (20.00 kW > 10.0 kW)"
+  ]
+}
+```
+
+##### Example 4: Anomaly — Higher Power Surge at 35 kW (`POST /predict`):
+
+```bash
+curl -X POST "http://localhost:8000/predict" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "asset": 1,
+       "items": 4.0,
+       "status": 2,
+       "power_avg": 35.0,
+       "alarm": 0,
+       "product": 1
+     }'
+```
+
+```json
+{
+  "is_anomaly": true,
+  "prediction": "anomaly",
+  "anomaly_percentage": 89.34,
+  "raw_score": 0.047232,
+  "message": "Anomaly detected: Power consumption exceeds rated limit (35.00 kW > 10.0 kW) with 89.34% anomaly score.",
+  "anomaly_reasons": [
+    "Power consumption exceeds rated limit (35.00 kW > 10.0 kW)"
   ]
 }
 ```
@@ -226,8 +253,8 @@ python predict.py --input path/to/data.csv
 # Save results to a file
 python predict.py --output results.csv
 
-# Show top 20 anomalies with 50% threshold
-python predict.py --top 20 --threshold 50.0
+# Show top 20 anomalies
+python predict.py --top 20
 ```
 
 ## Key Dependencies

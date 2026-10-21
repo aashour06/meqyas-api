@@ -1,7 +1,7 @@
 """
 Fast AI Predictor — loads the IsolationForest pipeline from model/ and
-produces anomaly predictions with percentage-based anomaly scores and
-operational diagnosis.
+produces anomaly predictions with dynamic continuous percentage-based anomaly scores
+and operational diagnosis.
 
 Usage:
     python predict.py                              # predict on default CSV
@@ -16,7 +16,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, List, Union
 
 import joblib
 import numpy as np
@@ -148,17 +148,17 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Score conversion & Anomaly Evaluation
+# Dynamic Continuous Score Conversion
 # ---------------------------------------------------------------------------
-def raw_scores_to_percentage(
+def calculate_ml_percentage(
     raw_scores: np.ndarray,
     min_score: float = BASELINE_MIN_SCORE,
     max_score: float = BASELINE_MAX_SCORE,
 ) -> np.ndarray:
     """
     Convert IsolationForest decision_function scores to a calibrated 0–100% anomaly score:
-      • raw_score >= 0: mapped to 0% - 50%
-      • raw_score < 0: mapped to 50% - 100%
+      • raw_score >= 0: mapped smoothly to 0% - 50%
+      • raw_score < 0: mapped smoothly to 50% - 100%
     """
     scores = np.asarray(raw_scores, dtype=float)
     pcts = np.zeros_like(scores, dtype=float)
@@ -174,6 +174,65 @@ def raw_scores_to_percentage(
         pcts[outlier_mask] = 100.0
 
     return np.round(np.clip(pcts, 0.0, 100.0), 2)
+
+
+def compute_operational_risk(
+    alarm: int,
+    status_str: str,
+    power_avg: float,
+    items: float,
+) -> tuple[float, List[str]]:
+    """Compute continuous operational risk (0-100%) and reasons."""
+    reasons = []
+    risk_factors = []
+
+    if alarm == 1:
+        reasons.append("Active alarm (alarm=1)")
+        alarm_risk = 35.0 + min(15.0, max(0.0, power_avg - 2.0) * 2.0)
+        risk_factors.append(alarm_risk)
+
+    if status_str == "alarm or interrupted state":
+        reasons.append("Alarm/interrupted state")
+        status_risk = 25.0 + min(15.0, max(0.0, power_avg) * 1.5)
+        risk_factors.append(status_risk)
+    elif status_str == "idle":
+        if power_avg > 1.0:
+            reasons.append(f"Idle power draw ({power_avg:.1f} kW)")
+            risk_factors.append(min(35.0, power_avg * 8.0))
+        if items > 0:
+            reasons.append(f"Idle production ({items:.0f} items)")
+            risk_factors.append(min(30.0, 10.0 + items * 2.0))
+
+    if power_avg < 0:
+        reasons.append("Negative power reading")
+        risk_factors.append(55.0)
+    elif power_avg > MAX_RATED_POWER_KW:
+        excess = power_avg - MAX_RATED_POWER_KW
+        power_risk = 30.0 + min(40.0, (excess / 10.0) * 20.0)
+        reasons.append(f"Power surge ({power_avg:.1f} kW > {MAX_RATED_POWER_KW} kW)")
+        risk_factors.append(power_risk)
+    elif power_avg > 4.0:
+        elevated_risk = ((power_avg - 4.0) / 6.0) * 12.0
+        risk_factors.append(elevated_risk)
+
+    if items < 0:
+        reasons.append("Negative items produced")
+        risk_factors.append(55.0)
+    elif items > 15.0:
+        excess_items = min(1.0, (items - 15.0) / 35.0)
+        item_risk = 15.0 + excess_items * 20.0
+        reasons.append(f"High production rate ({items:.0f} items)")
+        risk_factors.append(item_risk)
+
+    if not risk_factors:
+        return 0.0, reasons
+
+    rem = 1.0
+    for rf in risk_factors:
+        rem *= (1.0 - min(100.0, rf) / 100.0)
+    combined_risk = (1.0 - rem) * 100.0
+
+    return round(combined_risk, 2), reasons
 
 
 # ---------------------------------------------------------------------------
@@ -224,15 +283,15 @@ def predict(
     t0 = time.perf_counter()
     raw_preds = model.predict(X)
     raw_scores = model.decision_function(X)
-    anomaly_pcts = raw_scores_to_percentage(raw_scores)
+    ml_pcts = calculate_ml_percentage(raw_scores)
     elapsed = time.perf_counter() - t0
     print(f"[INFO]  Predictions done in {elapsed:.3f}s")
 
-    # 5. Build results DataFrame with multi-criteria anomaly evaluation
+    # 5. Build results DataFrame with dynamic continuous percentage evaluation
     results = raw_df.copy()
     is_anomaly_list = []
     labels_list = []
-    adjusted_pcts = []
+    final_pcts = []
     reasons_list = []
 
     for i in range(len(results)):
@@ -241,36 +300,45 @@ def predict(
         power_val = float(raw_df["power_avg"].iloc[i]) if "power_avg" in raw_df.columns else 0.0
         items_val = float(raw_df["items"].iloc[i]) if "items" in raw_df.columns else 0.0
 
-        r_pct = float(anomaly_pcts[i])
-        reasons = []
+        op_risk, op_reasons = compute_operational_risk(alarm_val, status_str, power_val, items_val)
+        reasons = list(op_reasons)
 
-        if alarm_val == 1:
-            reasons.append("Active alarm (alarm=1)")
-            r_pct = max(r_pct, 85.0)
-        if status_str == "alarm or interrupted state":
-            reasons.append("Alarm/interrupted state")
-            r_pct = max(r_pct, 80.0)
-        if power_val > MAX_RATED_POWER_KW:
-            reasons.append(f"Power surge ({power_val:.1f} kW > {MAX_RATED_POWER_KW} kW)")
-            r_pct = max(r_pct, 85.0)
-        if power_val < 0 or items_val < 0:
-            reasons.append("Negative sensor reading")
-            r_pct = max(r_pct, 90.0)
         if raw_preds[i] == -1:
             reasons.append("Isolation Forest outlier")
-        if r_pct >= threshold:
-            reasons.append(f"Score >= {threshold}%")
 
-        is_anom = len(reasons) > 0
+        ml_p = float(ml_pcts[i])
+        if op_risk > 0:
+            combined_pct = 100.0 - ((100.0 - ml_p) * (100.0 - op_risk) / 100.0)
+            has_hard_fault = (
+                alarm_val == 1
+                or status_str == "alarm or interrupted state"
+                or power_val > MAX_RATED_POWER_KW
+                or power_val < 0
+                or items_val < 0
+            )
+            if has_hard_fault:
+                r_pct = 50.0 + (combined_pct / 100.0) * 48.0
+            else:
+                r_pct = combined_pct
+        else:
+            r_pct = ml_p
+
+        r_pct = round(float(np.clip(r_pct, 0.0, 100.0)), 2)
+
+        if r_pct >= threshold and not any("threshold" in r for r in reasons):
+            if not op_reasons and raw_preds[i] != -1:
+                reasons.append(f"Score >= {threshold}%")
+
+        is_anom = len(reasons) > 0 or r_pct >= threshold or raw_preds[i] == -1
         is_anomaly_list.append(is_anom)
         labels_list.append("anomaly" if is_anom else "normal")
-        adjusted_pcts.append(round(r_pct, 2))
+        final_pcts.append(r_pct)
         reasons_list.append("; ".join(reasons) if is_anom else "Normal")
 
     results["is_anomaly"] = is_anomaly_list
     results["prediction"] = labels_list
     results["raw_score"] = np.round(raw_scores, 6)
-    results["anomaly_score_pct"] = adjusted_pcts
+    results["anomaly_score_pct"] = final_pcts
     results["anomaly_reasons"] = reasons_list
 
     # 6. Summary statistics
@@ -283,8 +351,8 @@ def predict(
     print(f"  Total rows        : {len(results):>8,}")
     print(f"  Normal             : {n_normal:>8,}  ({n_normal / len(results) * 100:.2f}%)")
     print(f"  Anomalies          : {n_anomalies:>8,}  ({n_anomalies / len(results) * 100:.2f}%)")
-    print(f"  Avg anomaly score  : {np.mean(adjusted_pcts):>8.2f}%")
-    print(f"  Max anomaly score  : {np.max(adjusted_pcts):>8.2f}%")
+    print(f"  Avg anomaly score  : {np.mean(final_pcts):>8.2f}%")
+    print(f"  Max anomaly score  : {np.max(final_pcts):>8.2f}%")
     print("=" * 60)
     print()
 

@@ -1,6 +1,7 @@
 """
 Test script for MEQYAS AI Anomaly Detection API
 Verifies normal, alarm, status, power surge, and batch conditions.
+Also verifies that anomaly_percentage changes dynamically and is NOT stuck at 85%.
 """
 
 import sys
@@ -126,15 +127,47 @@ power_surge_payload = {
     "product": 1,
 }
 r_surge = client.post("/predict", json=power_surge_payload)
-print("Power Surge Response:", r_surge.json())
+print("Power Surge (20 kW) Response:", r_surge.json())
 res_surge = r_surge.json()
 assert r_surge.status_code == 200
 assert res_surge["is_anomaly"] is True, f"Expected True, got {res_surge['is_anomaly']}"
 assert res_surge["prediction"] == "anomaly", f"Expected 'anomaly', got {res_surge['prediction']}"
-print(">>> Power surge test PASSED")
+
+# Test higher power surge to confirm dynamic scaling
+power_surge_high_payload = {
+    "asset": 1,
+    "items": 4.0,
+    "status": 2,
+    "power_avg": 35.0,
+    "alarm": 0,
+    "product": 1,
+}
+r_surge_high = client.post("/predict", json=power_surge_high_payload)
+print("Higher Power Surge (35 kW) Response:", r_surge_high.json())
+res_surge_high = r_surge_high.json()
+assert res_surge_high["anomaly_percentage"] > res_surge["anomaly_percentage"], (
+    f"Expected higher surge {res_surge_high['anomaly_percentage']}% > {res_surge['anomaly_percentage']}%"
+)
+print(">>> Power surge dynamic scaling test PASSED")
 
 print("\n" + "=" * 60)
-print("8. Testing Batch Prediction (2 normal, 2 anomaly)...")
+print("8. Verifying Dynamic Anomaly Percentage (Scores must differ, not all 85%)...")
+anomaly_scores = [
+    res_alarm["anomaly_percentage"],
+    res_status_alarm["anomaly_percentage"],
+    res_status_3["anomaly_percentage"],
+    res_surge["anomaly_percentage"],
+    res_surge_high["anomaly_percentage"],
+]
+print("Collected anomaly scores for different conditions:", anomaly_scores)
+unique_scores = set(anomaly_scores)
+print(f"Number of distinct scores: {len(unique_scores)} out of {len(anomaly_scores)}")
+assert len(unique_scores) >= 4, f"Scores must vary dynamically! Got: {unique_scores}"
+assert not all(s == 85.0 for s in anomaly_scores), "Scores should NOT all be 85.0%!"
+print(">>> Dynamic anomaly percentage verification PASSED")
+
+print("\n" + "=" * 60)
+print("9. Testing Batch Prediction (2 normal, 2 anomaly)...")
 batch_payload = {
     "readings": [
         normal_payload,
@@ -161,7 +194,7 @@ assert batch_data["normal_count"] == 2, f"Expected 2 normal, got {batch_data['no
 print(">>> Batch prediction test PASSED")
 
 print("\n" + "=" * 60)
-print("9. Testing CSV Prediction on subset data...")
+print("10. Testing CSV Prediction on subset data...")
 csv_path = Path("data/raw/company_A_labelled_subset.csv")
 if csv_path.exists():
     with open(csv_path, "rb") as f:
@@ -177,5 +210,5 @@ if csv_path.exists():
     print(">>> CSV prediction test PASSED")
 
 print("\n" + "=" * 60)
-print("ALL TESTS COMPLETED SUCCESSFULLY! ALL CONDITIONS PROPERLY DETECTED!")
+print("ALL TESTS COMPLETED SUCCESSFULLY! ANOMALY PERCENTAGE IS DYNAMIC!")
 print("=" * 60)

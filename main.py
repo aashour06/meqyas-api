@@ -112,9 +112,9 @@ app = FastAPI(
     description=(
         "Industrial telemetry anomaly detection service for MEQYAS. "
         "Predicts whether machine energy and production telemetry is anomalous, "
-        "with percentage-based anomaly scores and multi-criteria diagnostic evaluation."
+        "with dynamic continuous percentage-based anomaly scores and diagnostic evaluation."
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -197,7 +197,7 @@ class SinglePredictionResponse(BaseModel):
     )
     anomaly_percentage: float = Field(
         ...,
-        description="Anomaly score as a percentage (0% = completely normal, 100% = most anomalous)",
+        description="Continuously scaled anomaly percentage (0% = completely normal, 100% = most anomalous)",
     )
     raw_score: float = Field(
         ...,
@@ -250,8 +250,6 @@ def normalize_asset(val: Union[int, float, str]) -> str:
             return f"machine_{num_part}"
     try:
         num = int(float(val_str))
-        # Handle 0-based indexing (0, 1, 2) -> machine_1, machine_2, machine_3
-        # Handle 1-based indexing (1, 2, 3): 3 -> machine_3
         if num == 3:
             return "machine_3"
         elif num in (0, 1, 2):
@@ -273,7 +271,6 @@ def normalize_product(val: Union[int, float, str]) -> str:
             return f"product_{num_part}"
     try:
         num = int(float(val_str))
-        # Handle 0-based indexing 0..13 -> product_1..product_14
         if num == 14:
             return "product_14"
         elif 0 <= num <= 13:
@@ -294,7 +291,6 @@ def normalize_status(val: Union[int, float, str]) -> str:
     """
     val_str = str(val).strip().lower()
 
-    # Direct keyword matching for alarm / interrupted conditions
     if any(k in val_str for k in ("alarm", "interrupted", "fault", "error", "alert", "breakdown", "warning")):
         return "alarm or interrupted state"
     if any(k in val_str for k in ("auto", "automatic", "running", "normal")):
@@ -304,7 +300,6 @@ def normalize_status(val: Union[int, float, str]) -> str:
     if any(k in val_str for k in ("idle", "stopped", "standby", "off")):
         return "idle"
 
-    # Numeric code lookup (0: idle, 1: manual, 2: automatic, 3: alarm or interrupted state)
     try:
         int_code = int(float(val_str))
         if int_code in STATUS_MAP:
@@ -329,24 +324,19 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Apply the same transformations used during model training."""
     df = df.copy()
 
-    # Normalize categorical columns
     if "asset" in df.columns:
         df["asset"] = df["asset"].apply(normalize_asset)
     if "product" in df.columns:
         df["product"] = df["product"].apply(normalize_product)
     if "status" in df.columns:
         df["status"] = df["status"].apply(normalize_status)
-
-    # Normalize alarm column
     if "alarm" in df.columns:
         df["alarm"] = df["alarm"].apply(normalize_alarm)
 
-    # Drop columns not used by the trained model
     drop_cols = [c for c in COLUMNS_TO_DROP if c in df.columns]
     if drop_cols:
         df = df.drop(columns=drop_cols)
 
-    # Ensure required numeric columns are present and numeric
     for col in ["items", "power_avg", "alarm"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
@@ -355,9 +345,9 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Anomaly Scoring & Evaluation
+# Continuous Dynamic Anomaly Scoring & Evaluation
 # ---------------------------------------------------------------------------
-def calculate_anomaly_percentage(
+def calculate_ml_percentage(
     raw_scores: Union[np.ndarray, List[float], float],
     min_score: float = BASELINE_MIN_SCORE,
     max_score: float = BASELINE_MAX_SCORE,
@@ -368,19 +358,14 @@ def calculate_anomaly_percentage(
         (max_score -> 0.0%, 0.114 -> ~25.5%, 0.0 -> 50.0%)
       • raw_score < 0  (Anomaly / outlier): mapped smoothly to 50% - 100%
         (0.0 -> 50.0%, min_score -> 100.0%)
-    This guarantees that the decision boundary (raw_score = 0) perfectly aligns with 50.0%.
     """
     scores = np.asarray(raw_scores, dtype=float)
     pcts = np.zeros_like(scores, dtype=float)
 
-    # Inlier region (scores >= 0): 0% to 50%
     inlier_mask = scores >= 0
     if max_score > 0:
         pcts[inlier_mask] = (max_score - scores[inlier_mask]) / max_score * 50.0
-    else:
-        pcts[inlier_mask] = 0.0
 
-    # Outlier region (scores < 0): 50% to 100%
     outlier_mask = scores < 0
     if min_score < 0:
         pcts[outlier_mask] = 50.0 + ((-scores[outlier_mask]) / (-min_score)) * 50.0
@@ -390,10 +375,80 @@ def calculate_anomaly_percentage(
     return np.round(np.clip(pcts, 0.0, 100.0), 2)
 
 
+def compute_operational_risk(
+    alarm: int,
+    status_str: str,
+    power_avg: float,
+    items: float,
+) -> tuple[float, List[str]]:
+    """
+    Compute continuous operational risk (0-100%) and reasons based on physical telemetry.
+    The score varies smoothly and proportionally with power draw, item rate, and alarm state.
+    """
+    reasons = []
+    risk_factors = []
+
+    # 1. Active alarm flag
+    if alarm == 1:
+        reasons.append("Active machine alarm signal (alarm=1)")
+        # Dynamic alarm contribution scaling with power state
+        alarm_risk = 35.0 + min(15.0, max(0.0, power_avg - 2.0) * 2.0)
+        risk_factors.append(alarm_risk)
+
+    # 2. Machine status
+    if status_str == "alarm or interrupted state":
+        reasons.append("Machine in alarm or interrupted state (status=3)")
+        status_risk = 25.0 + min(15.0, max(0.0, power_avg) * 1.5)
+        risk_factors.append(status_risk)
+    elif status_str == "idle":
+        if power_avg > 1.0:
+            reasons.append(f"Excess power draw while machine is idle ({power_avg:.2f} kW)")
+            risk_factors.append(min(35.0, power_avg * 8.0))
+        if items > 0:
+            reasons.append(f"Items reported produced while machine is idle ({items:.1f} items)")
+            risk_factors.append(min(30.0, 10.0 + items * 2.0))
+
+    # 3. Power consumption
+    if power_avg < 0:
+        reasons.append(f"Invalid negative power consumption ({power_avg:.2f} kW)")
+        risk_factors.append(55.0)
+    elif power_avg > MAX_RATED_POWER_KW:
+        excess = power_avg - MAX_RATED_POWER_KW
+        # Continuous scaling based on how far power exceeds 10 kW
+        power_risk = 30.0 + min(40.0, (excess / 10.0) * 20.0)
+        reasons.append(f"Power consumption exceeds rated limit ({power_avg:.2f} kW > {MAX_RATED_POWER_KW:.1f} kW)")
+        risk_factors.append(power_risk)
+    elif power_avg > 4.0:
+        # Elevated power above 75th percentile within allowable range
+        elevated_risk = ((power_avg - 4.0) / 6.0) * 12.0
+        risk_factors.append(elevated_risk)
+
+    # 4. Items produced
+    if items < 0:
+        reasons.append(f"Invalid negative items produced ({items:.2f})")
+        risk_factors.append(55.0)
+    elif items > 15.0:
+        excess_items = min(1.0, (items - 15.0) / 35.0)
+        item_risk = 15.0 + excess_items * 20.0
+        reasons.append(f"Abnormally high item production ({items:.1f} items in interval)")
+        risk_factors.append(item_risk)
+
+    if not risk_factors:
+        return 0.0, reasons
+
+    # Combine risk factors probabilistically: 1 - prod(1 - r_i / 100)
+    rem = 1.0
+    for rf in risk_factors:
+        rem *= (1.0 - min(100.0, rf) / 100.0)
+    combined_risk = (1.0 - rem) * 100.0
+
+    return round(combined_risk, 2), reasons
+
+
 def evaluate_anomaly(
     raw_pred: int,
     raw_score: float,
-    anomaly_pct: float,
+    ml_pct: float,
     alarm: int,
     status_str: str,
     power_avg: float,
@@ -402,62 +457,62 @@ def evaluate_anomaly(
 ) -> tuple[bool, str, float, str, List[str]]:
     """
     Comprehensive multi-criteria anomaly evaluation:
-      1. Active alarm signal (alarm == 1)
-      2. Alarm or interrupted machine state (status in alarm/interrupted)
-      3. Severe operational out-of-bound conditions (power surge > 10 kW, negative readings)
-      4. Isolation Forest model prediction (raw_pred == -1, i.e., raw_score < 0)
-      5. Anomaly percentage exceeding threshold (anomaly_pct >= threshold)
+      Calculates dynamic, continuous anomaly percentage that changes proportionally
+      based on ML Isolation Forest scores and operational telemetry factors (power, items, alarm).
     """
-    reasons = []
+    op_risk, op_reasons = compute_operational_risk(alarm, status_str, power_avg, items)
+    reasons = list(op_reasons)
 
-    # Check 1: Active alarm flag
-    if alarm == 1:
-        reasons.append("Active machine alarm signal (alarm=1)")
-
-    # Check 2: Alarm or interrupted machine status
-    if status_str == "alarm or interrupted state":
-        reasons.append("Machine in alarm or interrupted state (status=3)")
-
-    # Check 3: Power consumption exceeds rated machine maximum
-    if power_avg > MAX_RATED_POWER_KW:
-        reasons.append(f"Power consumption exceeds rated limit ({power_avg:.2f} kW > {MAX_RATED_POWER_KW:.1f} kW)")
-
-    # Check 4: Sensor telemetry invalid negative readings
-    if power_avg < 0:
-        reasons.append(f"Invalid negative power consumption ({power_avg:.2f} kW)")
-    if items < 0:
-        reasons.append(f"Invalid negative items produced ({items:.2f})")
-
-    # Check 5: Isolation Forest model prediction
+    # Check ML model outlier prediction
     if raw_pred == -1:
         reasons.append(f"Isolation Forest classified reading as outlier (raw_score={raw_score:.6f} < 0)")
 
-    # Check 6: Anomaly score meets or exceeds threshold
-    if anomaly_pct >= threshold:
-        reasons.append(f"Anomaly score ({anomaly_pct:.2f}%) meets or exceeds threshold ({threshold:.2f}%)")
+    # Dynamically scale final percentage based on both ML score and operational risk
+    if op_risk > 0:
+        combined_pct = 100.0 - ((100.0 - ml_pct) * (100.0 - op_risk) / 100.0)
+        # For explicit operational faults (alarm, interrupted status, power surge, negative values),
+        # scale dynamically within the anomaly range [52%, 99%]
+        has_hard_fault = (
+            alarm == 1
+            or status_str == "alarm or interrupted state"
+            or power_avg > MAX_RATED_POWER_KW
+            or power_avg < 0
+            or items < 0
+        )
+        if has_hard_fault:
+            final_pct = 50.0 + (combined_pct / 100.0) * 48.0
+        else:
+            final_pct = combined_pct
+    else:
+        final_pct = ml_pct
 
-    is_anomaly = len(reasons) > 0
+    final_pct = round(float(np.clip(final_pct, 0.0, 100.0)), 2)
 
-    # Ensure final score reflects anomaly severity when explicit alarm/conditions trigger
-    final_pct = anomaly_pct
-    if alarm == 1:
-        final_pct = max(final_pct, 85.0)
-    elif status_str == "alarm or interrupted state":
-        final_pct = max(final_pct, 80.0)
-    elif power_avg > MAX_RATED_POWER_KW:
-        final_pct = max(final_pct, 85.0)
-    elif power_avg < 0 or items < 0:
-        final_pct = max(final_pct, 90.0)
+    # Flag threshold condition if score meets or exceeds threshold
+    if final_pct >= threshold and not any("threshold" in r for r in reasons):
+        if not op_reasons and raw_pred != -1:
+            reasons.append(f"Anomaly score ({final_pct:.2f}%) meets or exceeds threshold ({threshold:.2f}%)")
+
+    is_anomaly = len(reasons) > 0 or final_pct >= threshold or raw_pred == -1
 
     pred_label = "anomaly" if is_anomaly else "normal"
 
     if is_anomaly:
-        primary_reason = reasons[0]
+        primary_reason = reasons[0] if reasons else f"Score {final_pct:.2f}% >= {threshold:.2f}%"
         message = f"Anomaly detected: {primary_reason} with {final_pct:.2f}% anomaly score."
     else:
         message = f"Reading is normal with {final_pct:.2f}% anomaly score."
 
-    return is_anomaly, pred_label, float(final_pct), message, reasons
+    return is_anomaly, pred_label, final_pct, message, reasons
+
+
+def calculate_anomaly_percentage(
+    raw_scores: Union[np.ndarray, List[float], float],
+    min_score: float = BASELINE_MIN_SCORE,
+    max_score: float = BASELINE_MAX_SCORE,
+) -> np.ndarray:
+    """Wrapper maintaining backward compatibility."""
+    return calculate_ml_percentage(raw_scores, min_score, max_score)
 
 
 def get_loaded_model():
@@ -512,7 +567,7 @@ def health_check():
 def predict_single(reading: TelemetryReading):
     """
     Predict whether a single telemetry reading is an anomaly or normal,
-    evaluating both ML Isolation Forest scores and operational conditions (alarms, status, power extremes).
+    returning a continuous dynamic anomaly percentage scaling proportionally with telemetry severity.
     """
     model = get_loaded_model()
 
@@ -538,12 +593,12 @@ def predict_single(reading: TelemetryReading):
             detail=f"Inference error: {exc}",
         )
 
-    base_pct = float(calculate_anomaly_percentage(np.array([raw_score]))[0])
+    base_ml_pct = float(calculate_ml_percentage(np.array([raw_score]))[0])
 
     is_anomaly, pred_label, final_pct, message, reasons = evaluate_anomaly(
         raw_pred=raw_pred,
         raw_score=raw_score,
-        anomaly_pct=base_pct,
+        ml_pct=base_ml_pct,
         alarm=alarm_val,
         status_str=status_str,
         power_avg=power_val,
@@ -564,7 +619,7 @@ def predict_single(reading: TelemetryReading):
 @app.post("/predict/batch", response_model=BatchPredictionResponse, tags=["Inference"])
 def predict_batch(batch: BatchPredictionRequest):
     """
-    Predict anomaly status and percentages for multiple telemetry readings.
+    Predict anomaly status and dynamic percentages for multiple telemetry readings.
     """
     if not batch.readings:
         raise HTTPException(
@@ -607,17 +662,17 @@ def predict_batch(batch: BatchPredictionRequest):
             detail=f"Inference error during batch execution: {exc}",
         )
 
-    base_pcts = calculate_anomaly_percentage(raw_scores)
+    base_ml_pcts = calculate_ml_percentage(raw_scores)
 
     results: List[SinglePredictionResponse] = []
     anomalies_count = 0
     all_final_pcts = []
 
-    for pred, score, base_pct, meta in zip(raw_preds, raw_scores, base_pcts, metadata_list):
+    for pred, score, ml_pct, meta in zip(raw_preds, raw_scores, base_ml_pcts, metadata_list):
         is_anomaly, pred_label, final_pct, message, reasons = evaluate_anomaly(
             raw_pred=int(pred),
             raw_score=float(score),
-            anomaly_pct=float(base_pct),
+            ml_pct=float(ml_pct),
             alarm=meta["alarm"],
             status_str=meta["status_str"],
             power_avg=meta["power_avg"],
@@ -697,7 +752,7 @@ async def predict_from_csv(
             detail=f"Inference error on CSV data: {exc}",
         )
 
-    base_pcts = calculate_anomaly_percentage(raw_scores)
+    base_ml_pcts = calculate_ml_percentage(raw_scores)
     total = len(raw_preds)
 
     anomalies_count = 0
@@ -713,7 +768,7 @@ async def predict_from_csv(
         is_anom, label, final_pct, msg, reasons = evaluate_anomaly(
             raw_pred=int(raw_preds[i]),
             raw_score=float(raw_scores[i]),
-            anomaly_pct=float(base_pcts[i]),
+            ml_pct=float(base_ml_pcts[i]),
             alarm=alarm_val,
             status_str=status_str,
             power_avg=power_val,
@@ -724,7 +779,7 @@ async def predict_from_csv(
             anomalies_count += 1
         final_pcts.append(final_pct)
 
-        if i < 50:  # Include detailed sample for first 50 rows
+        if i < 50:
             sample_results.append({
                 "row_index": i,
                 "is_anomaly": is_anom,
