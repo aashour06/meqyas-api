@@ -20,6 +20,7 @@ AI/
 │   └── meqyas.ipynb                # End-to-end analysis & training notebook
 ├── .env                            # Environment variables (git-ignored)
 ├── .gitignore
+├── main.py                         # FastAPI service for real-time anomaly detection
 ├── predict.py                      # CLI script for batch anomaly prediction
 ├── requirements.txt
 └── README.md
@@ -79,19 +80,15 @@ Data Reading → EDA → Feature Engineering → Preprocessing → Model Trainin
 - **Scoring**: Custom anomaly scoring function based on decision-function separation
 - **Train/Test split**: 70 / 30 (random_state=42)
 
-### 5. Output
+### 5. Multi-Criteria Anomaly Detection
 
-- Anomalies labeled as `-1`, normal points as `1`
-- Results grouped by `status` and `alarm` for interpretability
-- Trained model serialized to `model/IsolationForest_Model.joblib`
-
-## Responsibilities
-
-- Energy consumption analysis
-- Anomaly detection
-- Energy efficiency recommendations
-- AI model development and evaluation
-- Integration with the backend API
+A reading is identified as an anomaly if any of the following conditions occur:
+1. **Active machine alarm** (`alarm == 1`)
+2. **Alarm or interrupted machine state** (`status == 3` or `"alarm or interrupted state"`)
+3. **Power surge exceeding rated machine limit** (`power_avg > 10.0 kW`)
+4. **Invalid sensor telemetry** (negative power or items)
+5. **Isolation Forest outlier detection** (`raw_score < 0`)
+6. **Anomaly score percentage meeting or exceeding threshold** (default 50.0%)
 
 ## Getting Started
 
@@ -114,10 +111,6 @@ pip install -r requirements.txt
 
 ### Usage
 
-1. Place raw CSV data in `data/raw/`.
-2. Open and run `notebook/meqyas.ipynb` to reproduce the full analysis.
-3. The trained model is saved to `model/IsolationForest_Model.joblib`.
-
 #### Running the FastAPI Server (Uvicorn)
 
 You can launch the FastAPI server directly with Python or using the Uvicorn CLI:
@@ -134,7 +127,7 @@ Once running, interactive API docs are accessible at:
 - **Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
 - **ReDoc**: [http://localhost:8000/redoc](http://localhost:8000/redoc)
 
-##### Example API Request (`POST /predict`):
+##### Example 1: Normal Reading (`POST /predict`):
 
 ```bash
 curl -X POST "http://localhost:8000/predict" \
@@ -149,15 +142,73 @@ curl -X POST "http://localhost:8000/predict" \
      }'
 ```
 
-##### Example Response:
-
 ```json
 {
   "is_anomaly": false,
   "prediction": "normal",
-  "anomaly_percentage": 39.41,
+  "anomaly_percentage": 25.47,
   "raw_score": 0.114097,
-  "message": "Reading is normal with 39.41% anomaly score."
+  "message": "Reading is normal with 25.47% anomaly score.",
+  "anomaly_reasons": null
+}
+```
+
+##### Example 2: Anomaly Condition — Active Alarm (`POST /predict`):
+
+```bash
+curl -X POST "http://localhost:8000/predict" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "asset": 0,
+       "items": 4.0,
+       "status": 3,
+       "power_avg": 2.0,
+       "alarm": 1,
+       "product": 0
+     }'
+```
+
+```json
+{
+  "is_anomaly": true,
+  "prediction": "anomaly",
+  "anomaly_percentage": 85.0,
+  "raw_score": 0.045123,
+  "message": "Anomaly detected: Active machine alarm signal (alarm=1) with 85.00% anomaly score.",
+  "anomaly_reasons": [
+    "Active machine alarm signal (alarm=1)",
+    "Machine in alarm or interrupted state (status=3)"
+  ]
+}
+```
+
+##### Example 3: Anomaly Condition — Extreme Power Surge (`POST /predict`):
+
+```bash
+curl -X POST "http://localhost:8000/predict" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "asset": 1,
+       "items": 2.0,
+       "status": 2,
+       "power_avg": 18.5,
+       "alarm": 0,
+       "product": 1
+     }'
+```
+
+```json
+{
+  "is_anomaly": true,
+  "prediction": "anomaly",
+  "anomaly_percentage": 85.0,
+  "raw_score": -0.012345,
+  "message": "Anomaly detected: Power consumption exceeds rated limit (18.50 kW > 10.0 kW) with 85.00% anomaly score.",
+  "anomaly_reasons": [
+    "Power consumption exceeds rated limit (18.50 kW > 10.0 kW)",
+    "Isolation Forest classified reading as outlier (raw_score=-0.012345 < 0)",
+    "Anomaly score (85.00%) meets or exceeds threshold (50.00%)"
+  ]
 }
 ```
 
@@ -175,21 +226,8 @@ python predict.py --input path/to/data.csv
 # Save results to a file
 python predict.py --output results.csv
 
-# Show top 20 anomalies
-python predict.py --top 20
-```
-
-The script mirrors the notebook preprocessing pipeline and outputs:
-- A **prediction summary** (total rows, normal/anomaly counts, score statistics)
-- A ranked list of the **top anomalies** by anomaly score percentage (0 % = normal, 100 % = most anomalous)
-
-#### Loading the model programmatically
-
-```python
-import joblib
-
-model = joblib.load("model/IsolationForest_Model.joblib")
-predictions = model.predict(X_new)  # -1 = anomaly, 1 = normal
+# Show top 20 anomalies with 50% threshold
+python predict.py --top 20 --threshold 50.0
 ```
 
 ## Key Dependencies
