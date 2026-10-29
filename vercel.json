@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/main.py"
+    }
+  ],
+  "functions": {
+    "main.py": {
+      "maxDuration": 30,
+      "excludeFiles": "{data/**,notebook/**,test_*.py,predict.py,*.md}"
+    }
+  }
+}

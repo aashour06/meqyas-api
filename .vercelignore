@@ -1,0 +1,23 @@
+# Training, raw, and processed datasets
+data/**
+
+# Research notebooks
+notebook/**
+
+# Local CLI scripts and test files
+test_*.py
+predict.py
+
+# Python caches and local virtual environments
+__pycache__/**
+*.pyc
+*.pyo
+.pytest_cache/**
+.env*
+.venv/**
+
+# Markdown documentation
+*.md
+
+# Git directory
+.git/**

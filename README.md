@@ -637,9 +637,46 @@ Interactive documentation is available at:
 
 ## Deployment Configuration
 
+### 1. Vercel Serverless Deployment
+
+The project is configured for serverless deployment on Vercel using [`vercel.json`](file:///D:/meqyas_api/vercel.json) and [`.vercelignore`](file:///D:/meqyas_api/.vercelignore):
+
+```json
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/main.py"
+    }
+  ],
+  "functions": {
+    "main.py": {
+      "maxDuration": 30,
+      "excludeFiles": "{data/**,notebook/**,test_*.py,predict.py,*.md}"
+    }
+  }
+}
+```
+
+#### Bundle Optimization Strategy (Resolving `LAMBDA_SIZE_EXCEEDED`):
+1. **Dependency Scope**: `requirements.txt` contains strictly production runtime dependencies for FastAPI, Scikit-learn, XGBoost, Pandas, NumPy, SciPy, Joblib, Openpyxl, and Python-multipart. Development, notebook (`ipykernel`, `ipython`, `jupyter`), plotting (`matplotlib`, `seaborn`, `pillow`), and debugger tools are omitted.
+2. **Asset Exclusion**: [`.vercelignore`](file:///D:/meqyas_api/.vercelignore) and `excludeFiles` exclude non-production assets (`data/**`, `notebook/**`, test suites, CLI tools, caches) from being packaged into the serverless function archive.
+3. **Artifact Retention**: Model artifacts in `model/` (`IsolationForest_Model.joblib`, `final_model.pkl`, `preprocessor.pkl`) are preserved and bundled with `main.py`.
+
+#### Large Functions Fallback (If Limits Are Exceeded on Future Models):
+Standard Vercel functions have a **500 MB** uncompressed bundle limit. If additional heavy deep-learning frameworks (e.g. PyTorch or Transformers) are added in the future:
+1. Open the **Vercel Dashboard** and select your project.
+2. Navigate to **Project Settings** $\rightarrow$ **Functions**.
+3. Enable **Large Functions** (available on Vercel Pro and Enterprise plans) to increase the function bundle limit to **1 GB** or **2 GB**.
+
+---
+
+### 2. Environment Variables
+
 | Environment Variable | Default | Description |
 |---|---|---|
-| `HOST` | `0.0.0.0` | Network binding interface |
+| `HOST` | `0.0.0.0` | Network binding interface for Uvicorn |
 | `PORT` | `8000` | Port for the ASGI Uvicorn server |
 
 The application uses relative paths derived from `Path(__file__).resolve().parent` to locate artifacts in `model/`, ensuring seamless operation across local machines, Docker containers, and cloud environments without path hardcoding.
