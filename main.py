@@ -1,22 +1,27 @@
 """
-MEQYAS AI - FastAPI Anomaly Detection Service
-============================================
-FastAPI service to detect anomalies in machine energy telemetry data
-using the trained IsolationForest pipeline loaded from the `model/` directory.
+MEQYAS AI — Unified Industrial Energy Intelligence & Anomaly Detection API
+===========================================================================
+Single FastAPI application integrating two complementary machine learning models:
+  1. Machine Telemetry Anomaly Detection: Unsupervised Isolation Forest model
+     monitoring machine operation states, alarms, production volume, and power surges.
+  2. Predictive Power Factor Risk Model: Supervised XGBoost pipeline forecasting
+     the risk of Low Power Factor (< 0.90) 3 hours in advance from 3-phase telemetry.
 
 Run directly:
     python main.py
 
-Or via Uvicorn CLI:
+Or with Uvicorn CLI:
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import io
 import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import joblib
 import numpy as np
@@ -26,99 +31,207 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-
 # ---------------------------------------------------------------------------
 # Paths and Constants
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "model"
 
-# Status code mapping matching training notebook & predict.py
+ISOLATION_FOREST_FILE = MODEL_DIR / "IsolationForest_Model.joblib"
+POWER_MODEL_FILE = MODEL_DIR / "final_model.pkl"
+
+# Model 1 (Isolation Forest) Constants
 STATUS_MAP = {
     0: "idle",
     1: "manual",
     2: "automatic",
     3: "alarm or interrupted state",
 }
-
 COLUMNS_TO_DROP = ["ts", "status_time", "cycle_time"]
-
-# Baseline min and max decision_function scores computed on training dataset
-# Used to convert raw decision_function scores into a calibrated 0-100% anomaly score:
-#   • raw_score >= 0 (Normal inlier): mapped to 0% - 50%
-#   • raw_score < 0  (Anomaly outlier): mapped to 50% - 100%
-# The IsolationForest decision boundary (raw_score == 0) aligns with 50.0%.
 BASELINE_MIN_SCORE = -0.06802
 BASELINE_MAX_SCORE = 0.23254
-DEFAULT_ANOMALY_THRESHOLD = 50.0  # Anomaly score percentage threshold
-MAX_RATED_POWER_KW = 10.0         # Maximum rated machine power consumption in dataset (kW)
+DEFAULT_MACHINE_THRESHOLD = 50.0  # Anomaly score percentage threshold
+DEFAULT_ANOMALY_THRESHOLD = DEFAULT_MACHINE_THRESHOLD  # Backward compatibility alias
+MAX_RATED_POWER_KW = 10.0
+
+# Model 2 (XGBoost Power Factor) Constants
+DEFAULT_POWER_THRESHOLD = 0.50
+POWER_REQUIRED_FEATURES = [
+    "hour",
+    "volt_A",
+    "volt_B",
+    "volt_C",
+    "I_A",
+    "I_B",
+    "I_C",
+    "Total_Active_Power",
+    "Total_Reactive_Power",
+    "Total_Power_Factor",
+    "Freq",
+    "Q_P_ratio",
+]
 
 
 # ---------------------------------------------------------------------------
-# Global Model Storage & Loader
+# Global Model Storage & Loaders
 # ---------------------------------------------------------------------------
 class ModelContainer:
-    model: Any = None
-    model_path: Optional[Path] = None
+    """Singleton container storing loaded models in memory."""
+    # Model 1: Isolation Forest
+    model: Any = None                     # Alias for backward compatibility with test_api.py
+    isolation_forest: Any = None
+    isolation_forest_path: Optional[Path] = None
+    isolation_forest_error: Optional[str] = None
+    model_path: Optional[Path] = None     # Alias for backward compatibility
+
+    # Model 2: XGBoost Power Factor Pipeline
+    power_model: Any = None
+    power_model_path: Optional[Path] = None
+    power_model_error: Optional[str] = None
 
 
 model_container = ModelContainer()
 
 
-def load_model_from_dir(directory: Path) -> Any:
-    """Find and load the trained model (.joblib) from the model directory."""
-    if not directory.exists():
-        raise FileNotFoundError(f"Model directory not found: {directory}")
-
-    joblib_files = sorted(directory.glob("*.joblib"))
-    if not joblib_files:
-        raise FileNotFoundError(f"No .joblib model files found in: {directory}")
-
-    # Prioritize 'IsolationForest_Model.joblib' if present, otherwise take the first
-    target_file = next(
-        (f for f in joblib_files if f.name == "IsolationForest_Model.joblib"),
-        joblib_files[0],
-    )
+def load_isolation_forest(path: Path = ISOLATION_FOREST_FILE) -> Any:
+    """Load the trained Isolation Forest pipeline from model directory."""
+    if not path.exists():
+        err = f"Isolation Forest model file not found: {path}"
+        model_container.isolation_forest_error = err
+        raise FileNotFoundError(err)
 
     t0 = time.perf_counter()
-    loaded_model = joblib.load(target_file)
+    loaded = joblib.load(path)
     elapsed = time.perf_counter() - t0
-    print(f"[INFO] Loaded model '{target_file.name}' in {elapsed:.3f}s from {target_file}")
-    model_container.model = loaded_model
-    model_container.model_path = target_file
-    return loaded_model
+    print(f"[INFO] Loaded Isolation Forest model '{path.name}' in {elapsed:.3f}s from {path}")
+
+    model_container.isolation_forest = loaded
+    model_container.isolation_forest_path = path
+    model_container.isolation_forest_error = None
+    model_container.model = loaded
+    model_container.model_path = path
+    return loaded
+
+
+def load_power_model(path: Path = POWER_MODEL_FILE) -> Any:
+    """Load the trained XGBoost Power Factor pipeline from model directory."""
+    if not path.exists():
+        err = f"Power Factor model file not found: {path}"
+        model_container.power_model_error = err
+        raise FileNotFoundError(err)
+
+    t0 = time.perf_counter()
+    loaded_obj = joblib.load(path)
+    elapsed = time.perf_counter() - t0
+
+    pipeline = loaded_obj.get("pipeline", loaded_obj) if isinstance(loaded_obj, dict) else loaded_obj
+    print(f"[INFO] Loaded XGBoost Power Factor model '{path.name}' in {elapsed:.3f}s from {path}")
+
+    model_container.power_model = pipeline
+    model_container.power_model_path = path
+    model_container.power_model_error = None
+    return pipeline
+
+
+def load_model_from_dir(directory: Path = MODEL_DIR) -> Any:
+    """Backward compatibility loader for test_api.py that ensures all models are loaded."""
+    load_all_models()
+    return model_container.isolation_forest
+
+
+def load_all_models() -> Tuple[bool, bool]:
+    """Load both models during startup."""
+    m1_ok = False
+    m2_ok = False
+
+    try:
+        load_isolation_forest(ISOLATION_FOREST_FILE)
+        m1_ok = True
+    except Exception as exc:
+        print(f"[ERROR] Failed to load Isolation Forest: {exc}", file=sys.stderr)
+
+    try:
+        load_power_model(POWER_MODEL_FILE)
+        m2_ok = True
+    except Exception as exc:
+        print(f"[ERROR] Failed to load Power Factor model: {exc}", file=sys.stderr)
+
+    return m1_ok, m2_ok
+
+
+def get_isolation_forest_model() -> Any:
+    """Retrieve loaded Isolation Forest model or attempt on-demand load."""
+    if model_container.isolation_forest is None:
+        try:
+            return load_isolation_forest()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Isolation Forest model is unavailable: {exc}",
+            )
+    return model_container.isolation_forest
+
+
+def get_loaded_model() -> Any:
+    """Backward compatibility helper for Isolation Forest model."""
+    return get_isolation_forest_model()
+
+
+def get_power_factor_model() -> Any:
+    """Retrieve loaded XGBoost Power Factor model or attempt on-demand load."""
+    if model_container.power_model is None:
+        try:
+            return load_power_model()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Power Factor prediction model is unavailable: {exc}",
+            )
+    return model_container.power_model
 
 
 # ---------------------------------------------------------------------------
-# Lifespan Handler (Model loading at startup)
+# Lifespan Handler (Model Loading on Server Startup)
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load ML model into memory on startup and clean up on shutdown."""
-    print("[INFO] Starting FastAPI Anomaly Detection Service...")
-    try:
-        load_model_from_dir(MODEL_DIR)
-    except Exception as exc:
-        print(f"[ERROR] Failed to load model from {MODEL_DIR}: {exc}", file=sys.stderr)
+    """Load both ML models into memory on server startup and release on shutdown."""
+    print("[INFO] Starting MEQYAS AI Unified Machine Learning Service...")
+    load_all_models()
     yield
-    print("[INFO] Shutting down FastAPI Anomaly Detection Service...")
+    print("[INFO] Shutting down MEQYAS AI Unified Machine Learning Service...")
 
 
 # ---------------------------------------------------------------------------
-# FastAPI App Definition
+# FastAPI Application Definition
 # ---------------------------------------------------------------------------
+tags_metadata = [
+    {
+        "name": "System & Health",
+        "description": "API status, operational readiness, and model metadata.",
+    },
+    {
+        "name": "Machine Anomaly Detection (Isolation Forest)",
+        "description": "Unsupervised telemetry anomaly detection for machine operations, alarms, and power spikes.",
+    },
+    {
+        "name": "Power Factor Prediction (XGBoost)",
+        "description": "Predictive forecasting of Low Power Factor (< 0.90) risk 3 hours into the future.",
+    },
+]
+
 app = FastAPI(
-    title="MEQYAS AI - Anomaly Detection API",
+    title="MEQYAS AI — Unified Industrial Energy & Anomaly Intelligence API",
     description=(
-        "Industrial telemetry anomaly detection service for MEQYAS. "
-        "Predicts whether machine energy and production telemetry is anomalous, "
-        "with dynamic continuous percentage-based anomaly scores and diagnostic evaluation."
+        "Production-grade unified AI service for MEQYAS smart industrial monitoring. "
+        "Integrates unsupervised machine-level anomaly detection (Isolation Forest) "
+        "and predictive 3-phase power quality forecasting (XGBoost)."
     ),
-    version="1.2.0",
+    version="2.0.0",
     lifespan=lifespan,
+    openapi_tags=tags_metadata,
 )
 
-# Enable CORS for frontend / external service access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -129,10 +242,10 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Request & Response Schemas
+# Schemas: Model 1 (Machine Telemetry Anomaly Detection)
 # ---------------------------------------------------------------------------
 class TelemetryReading(BaseModel):
-    """Input telemetry reading for anomaly detection."""
+    """Input telemetry reading for machine-level anomaly detection."""
     asset: Union[int, str] = Field(
         ...,
         description="Machine identifier: numeric (0, 1, 2) or string ('machine_1', 'machine_2', 'machine_3')",
@@ -179,14 +292,14 @@ class TelemetryReading(BaseModel):
         examples=[0.0],
     )
     threshold: Optional[float] = Field(
-        default=DEFAULT_ANOMALY_THRESHOLD,
+        default=DEFAULT_MACHINE_THRESHOLD,
         description="Anomaly score percentage threshold (0-100%) above which reading is classified as an anomaly. Default is 50.0%.",
         examples=[50.0],
     )
 
 
 class SinglePredictionResponse(BaseModel):
-    """Output prediction result for a single telemetry reading."""
+    """Output prediction result for a single machine telemetry reading."""
     is_anomaly: bool = Field(
         ...,
         description="Whether this reading is classified as an anomaly (True) or normal (False)",
@@ -214,20 +327,21 @@ class SinglePredictionResponse(BaseModel):
 
 
 class BatchPredictionRequest(BaseModel):
-    """Batch prediction request containing multiple telemetry readings."""
+    """Batch prediction request containing multiple machine telemetry readings."""
     readings: List[TelemetryReading] = Field(
         ...,
+        min_length=1,
         description="List of telemetry readings to evaluate",
     )
     threshold: Optional[float] = Field(
-        default=DEFAULT_ANOMALY_THRESHOLD,
+        default=DEFAULT_MACHINE_THRESHOLD,
         description="Anomaly percentage threshold (0-100%) for batch evaluation (default: 50.0%)",
         examples=[50.0],
     )
 
 
 class BatchPredictionResponse(BaseModel):
-    """Output for batch prediction requests."""
+    """Output summary for machine batch prediction requests."""
     total_readings: int
     anomalies_count: int
     normal_count: int
@@ -236,8 +350,85 @@ class BatchPredictionResponse(BaseModel):
     results: List[SinglePredictionResponse]
 
 
+# Aliases for explicit naming
+MachineTelemetryReading = TelemetryReading
+MachinePredictionResponse = SinglePredictionResponse
+MachineBatchRequest = BatchPredictionRequest
+MachineBatchResponse = BatchPredictionResponse
+
+
 # ---------------------------------------------------------------------------
-# Data Preprocessing & Normalization Helpers
+# Schemas: Model 2 (Predictive Power Factor Risk)
+# ---------------------------------------------------------------------------
+class PowerReading(BaseModel):
+    """Input 3-phase telemetry reading for Power Factor risk forecasting."""
+    volt_A: float = Field(..., description="Phase A Voltage (V)", examples=[126.8])
+    volt_B: float = Field(..., description="Phase B Voltage (V)", examples=[125.4])
+    volt_C: float = Field(..., description="Phase C Voltage (V)", examples=[126.2])
+    I_A: float = Field(..., description="Phase A Current (A)", examples=[0.35])
+    I_B: float = Field(..., description="Phase B Current (A)", examples=[0.42])
+    I_C: float = Field(..., description="Phase C Current (A)", examples=[0.21])
+    Total_Active_Power: Optional[float] = Field(None, description="Active Power P (kW)", examples=[0.087])
+    Total_Reactive_Power: Optional[float] = Field(None, description="Reactive Power Q (kVAR)", examples=[0.015])
+    Total_Power_Factor: Optional[float] = Field(None, description="Power Factor (0.0-1.0 or meter 1.0-2.0)", examples=[0.95])
+    Freq: Optional[float] = Field(None, description="Grid Frequency (Hz)", examples=[60.0])
+
+    # Hardware meter aliases (from raw industrial power monitors)
+    P_T: Optional[float] = Field(None, description="Hardware alias for Total_Active_Power")
+    Q_T: Optional[float] = Field(None, description="Hardware alias for Total_Reactive_Power")
+    FP_T: Optional[float] = Field(None, description="Hardware alias for Total_Power_Factor")
+    Frec: Optional[float] = Field(None, description="Hardware alias for Freq")
+
+    hour: Optional[int] = Field(None, description="Hour of day (0-23). Auto-derived if omitted", examples=[14])
+    Timestamp: Optional[str] = Field(None, description="ISO timestamp string (e.g. '2024-08-06 14:00:00')", examples=["2024-08-06 14:00:00"])
+    Q_P_ratio: Optional[float] = Field(None, description="Reactive/Active power ratio (auto-computed if omitted)")
+    threshold: Optional[float] = Field(DEFAULT_POWER_THRESHOLD, description="Decision threshold (default 0.50)", examples=[0.50])
+
+
+class PowerPredictionResponse(BaseModel):
+    """Output prediction for 3-hour Power Factor risk."""
+    prediction: str = Field(..., description="Classification label: 'Normal Power Factor' or 'Low Power Factor Risk (Anomaly)'")
+    is_low_pf_risk: bool = Field(..., description="True if risk probability >= threshold")
+    risk_probability: float = Field(..., description="Predicted probability (0.0 - 1.0)")
+    risk_percentage: float = Field(..., description="Predicted risk percentage (0.0% - 100.0%)")
+    threshold_used: float = Field(..., description="Probability threshold applied")
+    actual_power_factor: float = Field(..., description="Decoded physical power factor (0.0 - 1.0)")
+    computed_q_p_ratio: float = Field(..., description="Calculated Q/P ratio")
+    message: str = Field(..., description="Human-readable operational advisory")
+
+
+class PowerBatchRequest(BaseModel):
+    """Batch prediction request for multiple power telemetry readings."""
+    readings: List[PowerReading] = Field(..., min_length=1, description="List of power telemetry readings")
+    threshold: Optional[float] = Field(DEFAULT_POWER_THRESHOLD, description="Decision threshold applied across batch")
+
+
+class PowerBatchResponse(BaseModel):
+    """Output summary for power batch predictions."""
+    total: int = Field(..., description="Total readings evaluated")
+    low_pf_risk_count: int = Field(..., description="Count of low PF risk readings")
+    normal_count: int = Field(..., description="Count of normal PF readings")
+    risk_rate_pct: float = Field(..., description="Percentage of readings at risk")
+    results: List[PowerPredictionResponse] = Field(..., description="Detailed prediction list")
+
+
+class PowerFileUploadResponse(BaseModel):
+    """Output summary for CSV or Excel file prediction."""
+    filename: str
+    total_rows: int
+    low_pf_risk_count: int
+    normal_count: int
+    risk_rate_pct: float
+    average_risk_probability_pct: float
+    first_50_predictions: List[Dict[str, Any]]
+
+
+# Aliases
+PowerTelemetryReading = PowerReading
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing Helpers: Model 1 (Isolation Forest)
 # ---------------------------------------------------------------------------
 def normalize_asset(val: Union[int, float, str]) -> str:
     """Ensure machine asset is in format 'machine_X'."""
@@ -282,13 +473,7 @@ def normalize_product(val: Union[int, float, str]) -> str:
 
 
 def normalize_status(val: Union[int, float, str]) -> str:
-    """
-    Convert status code or string to one of the exact categories used during training:
-      - 'alarm or interrupted state'
-      - 'automatic'
-      - 'manual'
-      - 'idle'
-    """
+    """Convert status code or string to canonical training categories."""
     val_str = str(val).strip().lower()
 
     if any(k in val_str for k in ("alarm", "interrupted", "fault", "error", "alert", "breakdown", "warning")):
@@ -344,21 +529,12 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# Continuous Dynamic Anomaly Scoring & Evaluation
-# ---------------------------------------------------------------------------
 def calculate_ml_percentage(
     raw_scores: Union[np.ndarray, List[float], float],
     min_score: float = BASELINE_MIN_SCORE,
     max_score: float = BASELINE_MAX_SCORE,
 ) -> np.ndarray:
-    """
-    Convert IsolationForest decision_function scores to a calibrated 0–100% anomaly score:
-      • raw_score >= 0 (Normal / inlier): mapped smoothly to 0% - 50%
-        (max_score -> 0.0%, 0.114 -> ~25.5%, 0.0 -> 50.0%)
-      • raw_score < 0  (Anomaly / outlier): mapped smoothly to 50% - 100%
-        (0.0 -> 50.0%, min_score -> 100.0%)
-    """
+    """Convert raw IsolationForest scores to a calibrated 0-100% anomaly score."""
     scores = np.asarray(raw_scores, dtype=float)
     pcts = np.zeros_like(scores, dtype=float)
 
@@ -375,27 +551,30 @@ def calculate_ml_percentage(
     return np.round(np.clip(pcts, 0.0, 100.0), 2)
 
 
+def calculate_anomaly_percentage(
+    raw_scores: Union[np.ndarray, List[float], float],
+    min_score: float = BASELINE_MIN_SCORE,
+    max_score: float = BASELINE_MAX_SCORE,
+) -> np.ndarray:
+    """Backward compatibility alias."""
+    return calculate_ml_percentage(raw_scores, min_score, max_score)
+
+
 def compute_operational_risk(
     alarm: int,
     status_str: str,
     power_avg: float,
     items: float,
-) -> tuple[float, List[str]]:
-    """
-    Compute continuous operational risk (0-100%) and reasons based on physical telemetry.
-    The score varies smoothly and proportionally with power draw, item rate, and alarm state.
-    """
+) -> Tuple[float, List[str]]:
+    """Compute physical telemetry risk factors."""
     reasons = []
     risk_factors = []
 
-    # 1. Active alarm flag
     if alarm == 1:
         reasons.append("Active machine alarm signal (alarm=1)")
-        # Dynamic alarm contribution scaling with power state
         alarm_risk = 35.0 + min(15.0, max(0.0, power_avg - 2.0) * 2.0)
         risk_factors.append(alarm_risk)
 
-    # 2. Machine status
     if status_str == "alarm or interrupted state":
         reasons.append("Machine in alarm or interrupted state (status=3)")
         status_risk = 25.0 + min(15.0, max(0.0, power_avg) * 1.5)
@@ -408,22 +587,18 @@ def compute_operational_risk(
             reasons.append(f"Items reported produced while machine is idle ({items:.1f} items)")
             risk_factors.append(min(30.0, 10.0 + items * 2.0))
 
-    # 3. Power consumption
     if power_avg < 0:
         reasons.append(f"Invalid negative power consumption ({power_avg:.2f} kW)")
         risk_factors.append(55.0)
     elif power_avg > MAX_RATED_POWER_KW:
         excess = power_avg - MAX_RATED_POWER_KW
-        # Continuous scaling based on how far power exceeds 10 kW
         power_risk = 30.0 + min(40.0, (excess / 10.0) * 20.0)
         reasons.append(f"Power consumption exceeds rated limit ({power_avg:.2f} kW > {MAX_RATED_POWER_KW:.1f} kW)")
         risk_factors.append(power_risk)
     elif power_avg > 4.0:
-        # Elevated power above 75th percentile within allowable range
         elevated_risk = ((power_avg - 4.0) / 6.0) * 12.0
         risk_factors.append(elevated_risk)
 
-    # 4. Items produced
     if items < 0:
         reasons.append(f"Invalid negative items produced ({items:.2f})")
         risk_factors.append(55.0)
@@ -436,7 +611,6 @@ def compute_operational_risk(
     if not risk_factors:
         return 0.0, reasons
 
-    # Combine risk factors probabilistically: 1 - prod(1 - r_i / 100)
     rem = 1.0
     for rf in risk_factors:
         rem *= (1.0 - min(100.0, rf) / 100.0)
@@ -453,25 +627,17 @@ def evaluate_anomaly(
     status_str: str,
     power_avg: float,
     items: float,
-    threshold: float = DEFAULT_ANOMALY_THRESHOLD,
-) -> tuple[bool, str, float, str, List[str]]:
-    """
-    Comprehensive multi-criteria anomaly evaluation:
-      Calculates dynamic, continuous anomaly percentage that changes proportionally
-      based on ML Isolation Forest scores and operational telemetry factors (power, items, alarm).
-    """
+    threshold: float = DEFAULT_MACHINE_THRESHOLD,
+) -> Tuple[bool, str, float, str, List[str]]:
+    """Multi-criteria anomaly evaluation."""
     op_risk, op_reasons = compute_operational_risk(alarm, status_str, power_avg, items)
     reasons = list(op_reasons)
 
-    # Check ML model outlier prediction
     if raw_pred == -1:
         reasons.append(f"Isolation Forest classified reading as outlier (raw_score={raw_score:.6f} < 0)")
 
-    # Dynamically scale final percentage based on both ML score and operational risk
     if op_risk > 0:
         combined_pct = 100.0 - ((100.0 - ml_pct) * (100.0 - op_risk) / 100.0)
-        # For explicit operational faults (alarm, interrupted status, power surge, negative values),
-        # scale dynamically within the anomaly range [52%, 99%]
         has_hard_fault = (
             alarm == 1
             or status_str == "alarm or interrupted state"
@@ -488,13 +654,11 @@ def evaluate_anomaly(
 
     final_pct = round(float(np.clip(final_pct, 0.0, 100.0)), 2)
 
-    # Flag threshold condition if score meets or exceeds threshold
     if final_pct >= threshold and not any("threshold" in r for r in reasons):
         if not op_reasons and raw_pred != -1:
             reasons.append(f"Anomaly score ({final_pct:.2f}%) meets or exceeds threshold ({threshold:.2f}%)")
 
     is_anomaly = len(reasons) > 0 or final_pct >= threshold or raw_pred == -1
-
     pred_label = "anomaly" if is_anomaly else "normal"
 
     if is_anomaly:
@@ -506,91 +670,274 @@ def evaluate_anomaly(
     return is_anomaly, pred_label, final_pct, message, reasons
 
 
-def calculate_anomaly_percentage(
-    raw_scores: Union[np.ndarray, List[float], float],
-    min_score: float = BASELINE_MIN_SCORE,
-    max_score: float = BASELINE_MAX_SCORE,
-) -> np.ndarray:
-    """Wrapper maintaining backward compatibility."""
-    return calculate_ml_percentage(raw_scores, min_score, max_score)
+# ---------------------------------------------------------------------------
+# Preprocessing Helpers: Model 2 (XGBoost Power Factor)
+# ---------------------------------------------------------------------------
+def preprocess_power_reading(reading: PowerReading) -> Tuple[pd.DataFrame, float, float]:
+    """
+    Transforms a single PowerReading into the exact 12-feature DataFrame
+    expected by the final_model pipeline. Returns (df, actual_pf, qp_ratio).
+    """
+    # 1. Resolve Active Power
+    active_power = reading.Total_Active_Power if reading.Total_Active_Power is not None else reading.P_T
+    if active_power is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Active power required: provide Total_Active_Power or P_T",
+        )
 
+    # 2. Resolve Reactive Power
+    reactive_power = reading.Total_Reactive_Power if reading.Total_Reactive_Power is not None else reading.Q_T
+    if reactive_power is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Reactive power required: provide Total_Reactive_Power or Q_T",
+        )
 
-def get_loaded_model():
-    """Retrieve the loaded model or raise HTTP 503 if unavailable."""
-    if model_container.model is None:
+    # 3. Resolve Power Factor & Handle Meter Offset (+1)
+    raw_pf = reading.Total_Power_Factor if reading.Total_Power_Factor is not None else reading.FP_T
+    if raw_pf is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Power factor required: provide Total_Power_Factor or FP_T",
+        )
+
+    # Training data encoded PF with +1 offset (meter scale [1.0, 2.0])
+    if raw_pf <= 1.0:
+        model_pf = raw_pf + 1.0
+        actual_pf = round(raw_pf, 4)
+    else:
+        model_pf = raw_pf
+        actual_pf = round(raw_pf - 1.0, 4)
+
+    # 4. Resolve Frequency
+    freq = reading.Freq if reading.Freq is not None else reading.Frec
+    if freq is None:
+        freq = 60.0
+
+    # 5. Resolve Hour
+    if reading.hour is not None:
+        hour = int(reading.hour)
+    elif reading.Timestamp:
         try:
-            load_model_from_dir(MODEL_DIR)
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Model could not be loaded from '{MODEL_DIR}': {e}",
-            )
-    return model_container.model
+            hour = pd.to_datetime(reading.Timestamp).hour
+        except Exception:
+            hour = datetime.now().hour
+    else:
+        hour = datetime.now().hour
+
+    # 6. Resolve Q_P_ratio
+    if reading.Q_P_ratio is not None:
+        qp_ratio = float(reading.Q_P_ratio)
+    else:
+        qp_ratio = float(reactive_power / (abs(active_power) + 1e-9))
+
+    df = pd.DataFrame([{
+        "hour": hour,
+        "volt_A": float(reading.volt_A),
+        "volt_B": float(reading.volt_B),
+        "volt_C": float(reading.volt_C),
+        "I_A": float(reading.I_A),
+        "I_B": float(reading.I_B),
+        "I_C": float(reading.I_C),
+        "Total_Active_Power": float(active_power),
+        "Total_Reactive_Power": float(reactive_power),
+        "Total_Power_Factor": float(model_pf),
+        "Freq": float(freq),
+        "Q_P_ratio": round(qp_ratio, 6),
+    }], columns=POWER_REQUIRED_FEATURES)
+
+    return df, actual_pf, qp_ratio
+
+
+def prepare_power_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[float], List[float]]:
+    """
+    Standardizes a batch DataFrame of power readings (from CSV or Excel),
+    handling hardware column renames, hour derivation, Q/P ratio, and PF offset.
+    Returns (model_ready_df, actual_pfs, qp_ratios).
+    """
+    df = df.copy()
+
+    # Hardware meter column aliases mapping
+    alias_map = {
+        "P_T": "Total_Active_Power",
+        "Q_T": "Total_Reactive_Power",
+        "FP_T": "Total_Power_Factor",
+        "Frec": "Freq",
+    }
+    for old_col, new_col in alias_map.items():
+        if old_col in df.columns and new_col not in df.columns:
+            df[new_col] = df[old_col]
+
+    # Validate essential columns
+    required_cols = {"volt_A", "volt_B", "volt_C", "I_A", "I_B", "I_C", "Total_Active_Power", "Total_Reactive_Power", "Total_Power_Factor"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Missing required power columns: {sorted(missing)}",
+        )
+
+    if "Freq" not in df.columns:
+        df["Freq"] = 60.0
+
+    # Derive hour
+    if "hour" not in df.columns or df["hour"].isna().all():
+        if "Timestamp" in df.columns:
+            try:
+                df["hour"] = pd.to_datetime(df["Timestamp"]).dt.hour.fillna(datetime.now().hour).astype(int)
+            except Exception:
+                df["hour"] = datetime.now().hour
+        else:
+            df["hour"] = datetime.now().hour
+
+    # Calculate Q_P_ratio
+    if "Q_P_ratio" not in df.columns:
+        df["Q_P_ratio"] = df["Total_Reactive_Power"] / (df["Total_Active_Power"].abs() + 1e-9)
+
+    # Decode and normalize Power Factor
+    raw_pfs = df["Total_Power_Factor"].astype(float).values
+    actual_pfs = []
+    model_pfs = []
+    for pf in raw_pfs:
+        if pf <= 1.0:
+            model_pfs.append(pf + 1.0)
+            actual_pfs.append(round(pf, 4))
+        else:
+            model_pfs.append(pf)
+            actual_pfs.append(round(pf - 1.0, 4))
+
+    df["Total_Power_Factor"] = model_pfs
+    qp_ratios = [round(float(x), 4) for x in df["Q_P_ratio"].values]
+
+    # Select and order exact 12 features
+    model_df = df[POWER_REQUIRED_FEATURES].copy()
+    for col in POWER_REQUIRED_FEATURES:
+        model_df[col] = pd.to_numeric(model_df[col], errors="coerce").fillna(0.0)
+
+    return model_df, actual_pfs, qp_ratios
 
 
 # ---------------------------------------------------------------------------
-# API Routes
+# Endpoints: System & Health
 # ---------------------------------------------------------------------------
-@app.get("/", tags=["Info"])
-def root():
-    """Service overview, status, and loaded model metadata."""
-    model_loaded = model_container.model is not None
-    model_name = model_container.model_path.name if model_container.model_path else "None"
+@app.get("/", tags=["System & Health"])
+def root() -> Dict[str, Any]:
+    """Root endpoint with service overview, model status, and route directory."""
+    m1_ready = model_container.isolation_forest is not None
+    m2_ready = model_container.power_model is not None
+
     return {
-        "service": "MEQYAS AI - Anomaly Detection API",
+        "service": "MEQYAS AI — Unified Industrial Intelligence API",
+        "version": "2.0.0",
         "status": "online",
-        "model_loaded": model_loaded,
-        "model_name": model_name,
-        "default_threshold_pct": DEFAULT_ANOMALY_THRESHOLD,
+        "models": {
+            "model_1_machine_anomaly": {
+                "name": "IsolationForest_Model.joblib",
+                "framework": "Scikit-Learn",
+                "purpose": "Machine operational telemetry anomaly detection",
+                "loaded": m1_ready,
+                "default_threshold_pct": DEFAULT_MACHINE_THRESHOLD,
+            },
+            "model_2_power_factor": {
+                "name": "final_model.pkl",
+                "framework": "XGBoost + Scikit-Learn Pipeline",
+                "purpose": "Predictive Low Power Factor (< 0.90) risk forecasting (3 hours ahead)",
+                "loaded": m2_ready,
+                "default_threshold": DEFAULT_POWER_THRESHOLD,
+            },
+        },
         "docs_url": "/docs",
+        "redoc_url": "/redoc",
         "endpoints": {
-            "health": "/health",
-            "predict_single": "POST /predict",
-            "predict_batch": "POST /predict/batch",
-            "predict_csv": "POST /predict/csv",
+            "health": "GET /health",
+            "machine_anomaly": {
+                "predict_single": "POST /machine/predict",
+                "predict_batch": "POST /machine/predict/batch",
+                "predict_csv": "POST /machine/predict/csv",
+                "legacy_predict": "POST /predict",
+            },
+            "power_factor": {
+                "predict_single": "POST /power/predict",
+                "predict_batch": "POST /power/predict/batch",
+                "predict_file": "POST /power/predict/csv",
+            },
         },
     }
 
 
-@app.get("/health", tags=["Health"])
-def health_check():
-    """Health check endpoint for container and orchestration monitoring."""
-    model_loaded = model_container.model is not None
+@app.get("/health", tags=["System & Health"])
+def health_check() -> Dict[str, Any]:
+    """Readiness and health probe reporting status for both models."""
+    m1_ready = model_container.isolation_forest is not None
+    m2_ready = model_container.power_model is not None
+
+    if m1_ready and m2_ready:
+        overall_status = "healthy"
+    elif m1_ready or m2_ready:
+        overall_status = "degraded"
+    else:
+        overall_status = "unhealthy"
+
     return {
-        "status": "healthy" if model_loaded else "degraded",
-        "model_loaded": model_loaded,
-        "model_file": str(model_container.model_path) if model_container.model_path else None,
+        "status": overall_status,
+        "model_loaded": m1_ready,  # Backward compatibility field
+        "model_file": str(model_container.isolation_forest_path) if model_container.isolation_forest_path else None,
+        "models": {
+            "machine_anomaly_model": {
+                "loaded": m1_ready,
+                "file": model_container.isolation_forest_path.name if model_container.isolation_forest_path else None,
+                "error": model_container.isolation_forest_error,
+            },
+            "power_factor_model": {
+                "loaded": m2_ready,
+                "file": model_container.power_model_path.name if model_container.power_model_path else None,
+                "error": model_container.power_model_error,
+                "features_count": len(POWER_REQUIRED_FEATURES),
+            },
+        },
     }
 
 
-@app.post("/predict", response_model=SinglePredictionResponse, tags=["Inference"])
+# ---------------------------------------------------------------------------
+# Endpoints: Model 1 — Machine Telemetry Anomaly Detection (Isolation Forest)
+# ---------------------------------------------------------------------------
+@app.post(
+    "/machine/predict",
+    response_model=SinglePredictionResponse,
+    tags=["Machine Anomaly Detection (Isolation Forest)"],
+)
+@app.post(
+    "/predict",
+    response_model=SinglePredictionResponse,
+    tags=["Machine Anomaly Detection (Isolation Forest)"],
+    include_in_schema=True,
+)
 def predict_single(reading: TelemetryReading):
     """
-    Predict whether a single telemetry reading is an anomaly or normal,
-    returning a continuous dynamic anomaly percentage scaling proportionally with telemetry severity.
+    Predict whether a single machine telemetry reading is an anomaly or normal,
+    returning a continuous dynamic anomaly percentage (0-100%).
     """
-    model = get_loaded_model()
+    model = get_isolation_forest_model()
 
-    # Pre-extract input fields for operational checks
     alarm_val = normalize_alarm(reading.alarm)
     status_str = normalize_status(reading.status)
     power_val = float(reading.power_avg)
     items_val = float(reading.items)
-    threshold_val = float(reading.threshold) if reading.threshold is not None else DEFAULT_ANOMALY_THRESHOLD
+    threshold_val = float(reading.threshold) if reading.threshold is not None else DEFAULT_MACHINE_THRESHOLD
 
-    # Convert Pydantic object to DataFrame and preprocess for ML pipeline
     input_dict = reading.model_dump()
     input_dict["alarm"] = alarm_val
     input_df = pd.DataFrame([input_dict])
     X = prepare_dataframe(input_df)
 
     try:
-        raw_pred = int(model.predict(X)[0])               # 1 = inlier, -1 = outlier
+        raw_pred = int(model.predict(X)[0])
         raw_score = float(model.decision_function(X)[0])
     except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Inference error: {exc}",
+            status_code=422,
+            detail=f"Machine telemetry inference error: {exc}",
         )
 
     base_ml_pct = float(calculate_ml_percentage(np.array([raw_score]))[0])
@@ -616,10 +963,20 @@ def predict_single(reading: TelemetryReading):
     )
 
 
-@app.post("/predict/batch", response_model=BatchPredictionResponse, tags=["Inference"])
+@app.post(
+    "/machine/predict/batch",
+    response_model=BatchPredictionResponse,
+    tags=["Machine Anomaly Detection (Isolation Forest)"],
+)
+@app.post(
+    "/predict/batch",
+    response_model=BatchPredictionResponse,
+    tags=["Machine Anomaly Detection (Isolation Forest)"],
+    include_in_schema=True,
+)
 def predict_batch(batch: BatchPredictionRequest):
     """
-    Predict anomaly status and dynamic percentages for multiple telemetry readings.
+    Predict anomaly status and continuous percentages for a batch of machine readings.
     """
     if not batch.readings:
         raise HTTPException(
@@ -627,8 +984,8 @@ def predict_batch(batch: BatchPredictionRequest):
             detail="The readings list cannot be empty.",
         )
 
-    model = get_loaded_model()
-    threshold_val = float(batch.threshold) if batch.threshold is not None else DEFAULT_ANOMALY_THRESHOLD
+    model = get_isolation_forest_model()
+    threshold_val = float(batch.threshold) if batch.threshold is not None else DEFAULT_MACHINE_THRESHOLD
 
     prepared_records = []
     metadata_list = []
@@ -658,7 +1015,7 @@ def predict_batch(batch: BatchPredictionRequest):
         raw_scores = model.decision_function(X)
     except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=f"Inference error during batch execution: {exc}",
         )
 
@@ -709,24 +1066,33 @@ def predict_batch(batch: BatchPredictionRequest):
     )
 
 
-@app.post("/predict/csv", tags=["Inference"])
-async def predict_from_csv(
+@app.post(
+    "/machine/predict/csv",
+    tags=["Machine Anomaly Detection (Isolation Forest)"],
+)
+@app.post(
+    "/predict/csv",
+    tags=["Machine Anomaly Detection (Isolation Forest)"],
+    include_in_schema=True,
+)
+async def predict_machine_from_csv(
     file: UploadFile = File(...),
-    threshold: float = Query(DEFAULT_ANOMALY_THRESHOLD, description="Anomaly percentage threshold (0-100%)"),
+    threshold: float = Query(DEFAULT_MACHINE_THRESHOLD, description="Anomaly percentage threshold (0-100%)"),
 ):
     """
-    Upload a CSV file of telemetry readings to get anomaly predictions and summary stats.
+    Upload a CSV file of machine telemetry readings to run bulk anomaly scoring.
     """
     if not file.filename.endswith(".csv"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only CSV files (.csv) are supported.",
+            detail="Only CSV files (.csv) are supported for machine anomaly detection.",
         )
 
-    model = get_loaded_model()
+    model = get_isolation_forest_model()
 
     try:
-        raw_df = pd.read_csv(file.file)
+        content = await file.read()
+        raw_df = pd.read_csv(io.BytesIO(content))
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -737,7 +1103,7 @@ async def predict_from_csv(
     missing = required_cols - set(raw_df.columns)
     if missing:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=f"Missing required columns in CSV: {sorted(missing)}",
         )
 
@@ -748,7 +1114,7 @@ async def predict_from_csv(
         raw_scores = model.decision_function(X)
     except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=f"Inference error on CSV data: {exc}",
         )
 
@@ -804,10 +1170,228 @@ async def predict_from_csv(
 
 
 # ---------------------------------------------------------------------------
+# Endpoints: Model 2 — Predictive Power Factor Risk Model (XGBoost)
+# ---------------------------------------------------------------------------
+@app.post(
+    "/power/predict",
+    response_model=PowerPredictionResponse,
+    tags=["Power Factor Prediction (XGBoost)"],
+)
+def predict_power_single(reading: PowerReading):
+    """
+    Predict whether 3-phase power factor will drop below 0.90 within the next 3 hours.
+    """
+    model = get_power_factor_model()
+    df, actual_pf, qp_ratio = preprocess_power_reading(reading)
+    threshold = reading.threshold if reading.threshold is not None else DEFAULT_POWER_THRESHOLD
+
+    try:
+        prob = float(model.predict_proba(df)[0][1])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Power Factor model inference failed: {exc}",
+        )
+
+    is_risk = prob >= threshold
+    prob_pct = round(prob * 100.0, 2)
+
+    if is_risk:
+        message = (
+            f"ALERT: High risk ({prob_pct}%) of Power Factor dropping below 0.90 "
+            f"within 3 hours (Threshold: {threshold:.2f}). Corrective capacitor dispatch recommended."
+        )
+        label = "Low Power Factor Risk (Anomaly)"
+    else:
+        message = (
+            f"NORMAL: Power factor risk is low ({prob_pct}%). "
+            f"Operating stably above 0.90 (Current PF: {actual_pf:.2f})."
+        )
+        label = "Normal Power Factor"
+
+    return PowerPredictionResponse(
+        prediction=label,
+        is_low_pf_risk=is_risk,
+        risk_probability=round(prob, 4),
+        risk_percentage=prob_pct,
+        threshold_used=threshold,
+        actual_power_factor=actual_pf,
+        computed_q_p_ratio=round(qp_ratio, 4),
+        message=message,
+    )
+
+
+@app.post(
+    "/power/predict/batch",
+    response_model=PowerBatchResponse,
+    tags=["Power Factor Prediction (XGBoost)"],
+)
+def predict_power_batch(batch: PowerBatchRequest):
+    """
+    Predict Low Power Factor risk (< 0.90) for a batch of 3-phase electrical readings.
+    """
+    if not batch.readings:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The readings list cannot be empty.",
+        )
+
+    model = get_power_factor_model()
+    threshold = batch.threshold if batch.threshold is not None else DEFAULT_POWER_THRESHOLD
+
+    dfs = []
+    meta = []
+    for r in batch.readings:
+        df_row, actual_pf, qp_ratio = preprocess_power_reading(r)
+        dfs.append(df_row)
+        meta.append((actual_pf, qp_ratio))
+
+    df_combined = pd.concat(dfs, ignore_index=True)
+
+    try:
+        probs = model.predict_proba(df_combined)[:, 1]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Power batch inference failed: {exc}",
+        )
+
+    results: List[PowerPredictionResponse] = []
+    low_pf_count = 0
+
+    for prob_val, (actual_pf, qp_ratio) in zip(probs, meta):
+        p_float = float(prob_val)
+        is_risk = p_float >= threshold
+        p_pct = round(p_float * 100.0, 2)
+
+        if is_risk:
+            low_pf_count += 1
+            label = "Low Power Factor Risk (Anomaly)"
+            msg = (
+                f"ALERT: High risk ({p_pct}%) of Power Factor dropping below 0.90 "
+                f"within 3 hours (Threshold: {threshold:.2f})."
+            )
+        else:
+            label = "Normal Power Factor"
+            msg = f"NORMAL: Power factor risk is low ({p_pct}%). Current PF: {actual_pf:.2f}."
+
+        results.append(
+            PowerPredictionResponse(
+                prediction=label,
+                is_low_pf_risk=is_risk,
+                risk_probability=round(p_float, 4),
+                risk_percentage=p_pct,
+                threshold_used=threshold,
+                actual_power_factor=actual_pf,
+                computed_q_p_ratio=round(qp_ratio, 4),
+                message=msg,
+            )
+        )
+
+    total = len(batch.readings)
+    normal_count = total - low_pf_count
+    risk_rate = round((low_pf_count / total) * 100.0, 2)
+
+    return PowerBatchResponse(
+        total=total,
+        low_pf_risk_count=low_pf_count,
+        normal_count=normal_count,
+        risk_rate_pct=risk_rate,
+        results=results,
+    )
+
+
+@app.post(
+    "/power/predict/csv",
+    response_model=PowerFileUploadResponse,
+    tags=["Power Factor Prediction (XGBoost)"],
+)
+async def predict_power_from_file(
+    file: UploadFile = File(...),
+    threshold: float = Query(DEFAULT_POWER_THRESHOLD, description="Decision probability threshold (0.0 - 1.0)"),
+):
+    """
+    Upload a power monitoring file (.csv or .xlsx) to evaluate Low Power Factor risk across all records.
+    """
+    fname = file.filename.lower()
+    if not (fname.endswith(".csv") or fname.endswith(".xlsx") or fname.endswith(".xls")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Supported formats: .csv or .xlsx",
+        )
+
+    model = get_power_factor_model()
+
+    try:
+        content = await file.read()
+        if fname.endswith(".csv"):
+            raw_df = pd.read_csv(io.BytesIO(content))
+        else:
+            raw_df = pd.read_excel(io.BytesIO(content))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not parse uploaded file: {exc}",
+        )
+
+    model_df, actual_pfs, qp_ratios = prepare_power_dataframe(raw_df)
+
+    try:
+        probs = model.predict_proba(model_df)[:, 1]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Inference error on file data: {exc}",
+        )
+
+    total = len(probs)
+    low_risk_count = 0
+    all_prob_pcts = []
+    sample_results = []
+
+    for i in range(total):
+        p_val = float(probs[i])
+        is_risk = p_val >= threshold
+        p_pct = round(p_val * 100.0, 2)
+        all_prob_pcts.append(p_pct)
+
+        if is_risk:
+            low_risk_count += 1
+            label = "Low Power Factor Risk (Anomaly)"
+        else:
+            label = "Normal Power Factor"
+
+        if i < 50:
+            sample_results.append({
+                "row_index": i,
+                "is_low_pf_risk": is_risk,
+                "prediction": label,
+                "risk_probability": round(p_val, 4),
+                "risk_percentage": p_pct,
+                "actual_power_factor": actual_pfs[i],
+                "computed_q_p_ratio": qp_ratios[i],
+            })
+
+    normal_count = total - low_risk_count
+    risk_rate = round((low_risk_count / total) * 100.0, 2)
+    avg_prob = round(float(np.mean(all_prob_pcts)), 2) if all_prob_pcts else 0.0
+
+    return PowerFileUploadResponse(
+        filename=file.filename,
+        total_rows=total,
+        low_pf_risk_count=low_risk_count,
+        normal_count=normal_count,
+        risk_rate_pct=risk_rate,
+        average_risk_probability_pct=avg_prob,
+        first_50_predictions=sample_results,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Server Startup (Uvicorn)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
-    print(f"[INFO] Starting Uvicorn server on http://{host}:{port}")
+    print(f"[INFO] Starting MEQYAS AI Unified Server on http://{host}:{port}")
     uvicorn.run("main:app", host=host, port=port, reload=True)
