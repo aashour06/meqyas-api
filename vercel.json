@@ -1,13 +1,7 @@
 {
-  "version": 2,
-  "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": "/main.py"
-    }
-  ],
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "main.py": {
+    "app.py": {
       "maxDuration": 30,
       "excludeFiles": "{data/**,notebook/**,test_*.py,predict.py,*.md}"
     }

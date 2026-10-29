@@ -639,19 +639,13 @@ Interactive documentation is available at:
 
 ### 1. Vercel Serverless Deployment
 
-The project is configured for serverless deployment on Vercel using [`vercel.json`](file:///D:/meqyas_api/vercel.json) and [`.vercelignore`](file:///D:/meqyas_api/.vercelignore):
+The project is configured for serverless deployment on Vercel using `app.py` as entry point, [`vercel.json`](file:///D:/meqyas_api/vercel.json), and [`.vercelignore`](file:///D:/meqyas_api/.vercelignore):
 
 ```json
 {
-  "version": 2,
-  "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": "/main.py"
-    }
-  ],
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "main.py": {
+    "app.py": {
       "maxDuration": 30,
       "excludeFiles": "{data/**,notebook/**,test_*.py,predict.py,*.md}"
     }
@@ -662,7 +656,7 @@ The project is configured for serverless deployment on Vercel using [`vercel.jso
 #### Bundle Optimization Strategy (Resolving `LAMBDA_SIZE_EXCEEDED`):
 1. **Dependency Scope**: `requirements.txt` contains strictly production runtime dependencies for FastAPI, Scikit-learn, XGBoost, Pandas, NumPy, SciPy, Joblib, Openpyxl, and Python-multipart. Development, notebook (`ipykernel`, `ipython`, `jupyter`), plotting (`matplotlib`, `seaborn`, `pillow`), and debugger tools are omitted.
 2. **Asset Exclusion**: [`.vercelignore`](file:///D:/meqyas_api/.vercelignore) and `excludeFiles` exclude non-production assets (`data/**`, `notebook/**`, test suites, CLI tools, caches) from being packaged into the serverless function archive.
-3. **Artifact Retention**: Model artifacts in `model/` (`IsolationForest_Model.joblib`, `final_model.pkl`, `preprocessor.pkl`) are preserved and bundled with `main.py`.
+3. **Artifact Retention**: Model artifacts in `model/` (`IsolationForest_Model.joblib`, `final_model.pkl`, `preprocessor.pkl`) are preserved and bundled with `app.py` and `main.py`.
 
 #### Large Functions Fallback (If Limits Are Exceeded on Future Models):
 Standard Vercel functions have a **500 MB** uncompressed bundle limit. If additional heavy deep-learning frameworks (e.g. PyTorch or Transformers) are added in the future:
